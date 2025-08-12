@@ -1,0 +1,420 @@
+import { useConnection, useWallet } from "@solana/wallet-adapter-react"
+import { useState } from 'react'
+import { Keypair, Transaction, SystemProgram, PublicKey } from "@solana/web3.js"
+import { getMintLen, ExtensionType, LENGTH_SIZE, TYPE_SIZE, TOKEN_2022_PROGRAM_ID, createInitializeMetadataPointerInstruction, createInitializeMintInstruction, getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction, createMintToInstruction } from "@solana/spl-token"
+import { createInitializeInstruction, pack } from "@solana/spl-token-metadata"
+import axios from "axios"
+import { PDAUtil, ORCA_WHIRLPOOL_PROGRAM_ID as ORCA_LEGACY_PID, WhirlpoolContext, PriceMath, buildWhirlpoolClient } from "@orca-so/whirlpools-sdk"
+import { AnchorProvider } from "@coral-xyz/anchor"
+import Decimal from "decimal.js"
+import {
+    openFullRangePosition,
+    setWhirlpoolsConfig,
+  } from "@orca-so/whirlpools";
+
+export default function TokenLaunchpad({mintAddress, setMintAddress, isMinted, setIsMinted, lpCreated, setLpCreated, nextClicked, setNextClicked}) {
+
+    const wallet = useWallet()
+
+    const [name, setName] = useState("")
+
+    const [symbol, setSymbol] = useState("")
+
+    const [url, setUrl] = useState("")
+
+    const [uri, setUri] = useState("")
+
+    const [mintKP, setMintKP] = useState(null)
+
+    const [tokens, setTokens] = useState([{name: "WSOL", mint: "So11111111111111111111111111111111111111112", decimals: 9},
+        
+    {name: "USDC", mint: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU", decimals: 6}])
+
+    const [selectedToken, setSelectedToken] = useState(tokens[0].mint)
+
+    const [poolPKey, setPoolPKey] = useState("")
+
+    const { connection } = useConnection()
+
+    async function createToken() {
+
+        let metadata = {name: name, symbol: symbol, image: url}
+
+        let pinata_uri
+
+        try {
+
+            const {data} = await axios.post('http://localhost:3000/uri', metadata)
+
+            pinata_uri = data.uri
+
+            setUri(pinata_uri)
+        
+        } catch(err) {
+
+            console.log(err)
+
+            alert("Error in creating the pinata uri. Please try again!")
+
+            return
+        }
+
+        const mintKeypair = Keypair.generate()
+
+        const mintLen = getMintLen([ExtensionType.MetadataPointer])
+
+        metadata = {mint: mintKeypair.publicKey, name: name, symbol: symbol, uri: pinata_uri, additionalMetadata: []}
+
+        const metadataLen = TYPE_SIZE + LENGTH_SIZE + pack(metadata).length
+
+        const lamports = await connection.getMinimumBalanceForRentExemption(mintLen + metadataLen)
+
+        const transaction = new Transaction().add(
+
+            SystemProgram.createAccount({
+
+                fromPubkey: wallet.publicKey,
+                newAccountPubkey: mintKeypair.publicKey,
+                space: mintLen,
+                lamports,
+                programId: TOKEN_2022_PROGRAM_ID
+
+            }),
+
+            createInitializeMetadataPointerInstruction(mintKeypair.publicKey, wallet.publicKey, mintKeypair.publicKey, TOKEN_2022_PROGRAM_ID),
+
+            createInitializeMintInstruction(mintKeypair.publicKey, 9, wallet.publicKey, null, TOKEN_2022_PROGRAM_ID),
+
+            createInitializeInstruction({
+
+                programId: TOKEN_2022_PROGRAM_ID,
+                mint: mintKeypair.publicKey,
+                metadata: mintKeypair.publicKey,
+                name: metadata.name,
+                symbol: metadata.symbol,
+                uri: metadata.uri,
+                mintAuthority: wallet.publicKey,
+                updateAuthority: wallet.publicKey
+            })
+
+        )
+
+        transaction.feePayer = wallet.publicKey
+        
+        transaction.recentBlockhash = (await connection.getLatestBlockhash()).blockhash
+
+        transaction.partialSign(mintKeypair)
+
+        try {
+
+            await wallet.sendTransaction(transaction, connection)
+        
+        } catch(err) {
+
+            alert("Transaction failed, please try again!")
+
+            return
+        }
+
+        setMintAddress(mintKeypair.publicKey.toBase58())
+
+        setMintKP(mintKeypair)
+
+    }
+
+    async function mintTokens() {
+
+        const associatedTokenAddress = getAssociatedTokenAddressSync(mintKP.publicKey, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID)
+
+        const transaction = new Transaction().add(
+
+            createAssociatedTokenAccountInstruction(wallet.publicKey, associatedTokenAddress, wallet.publicKey, mintKP.publicKey, TOKEN_2022_PROGRAM_ID)
+
+        )
+
+        try {
+
+            await wallet.sendTransaction(transaction, connection)
+        
+        } catch(err) {
+
+            console.log(err)
+
+            alert("Error in creating associated token account.")
+
+            return
+        }
+
+        const tx = new Transaction().add(
+
+            createMintToInstruction(mintKP.publicKey, associatedTokenAddress, wallet.publicKey, 10000000000, [], TOKEN_2022_PROGRAM_ID)
+        )
+
+        try {
+
+            await wallet.sendTransaction(tx, connection)
+
+
+        } catch(err) {
+
+            alert("Error in minting the tokens, please try again!")
+
+            return
+        }
+
+        setIsMinted(true)
+    }
+
+    function takeBack() {
+
+        setName("")
+
+        setSymbol("")
+
+        setUrl("")
+
+        setUri("")
+
+        setMintAddress("")
+
+        setIsMinted(false)
+
+        setMintKP(null)
+
+        setLpCreated(false)
+
+        setNextClicked(false)
+    }
+
+    async function createPool() {
+
+        const mintA = new PublicKey(mintAddress)
+
+        const mintB = new PublicKey(selectedToken)
+
+        const [tokenAMint, tokenBMint] = mintA.toBuffer().compare(mintB.toBuffer()) < 0 ? [mintA, mintB] : [mintB, mintA]
+
+        const whirlpoolConfig = new PublicKey("2LecshUwdy9xi7meFgHtFJQNSKk4KdTrcpvaB56dP2NQ")
+
+        const tickSpacing = 128
+
+        const whirlpoolPDA = PDAUtil.getWhirlpool(
+
+            ORCA_LEGACY_PID,
+            
+            whirlpoolConfig,
+
+            tokenAMint,
+
+            tokenBMint,
+
+            tickSpacing
+        )
+
+        const whirlpoolPDAPublicKey = whirlpoolPDA.publicKey
+
+        const info = await connection.getAccountInfo(whirlpoolPDAPublicKey)
+
+        if(!!info) {
+
+            alert("This pool already exists, please try to create a different one.")
+
+            return
+        }
+
+        const anchorWallet = {
+            
+            publicKey: wallet.publicKey,
+            
+            signTransaction: wallet.signTransaction,
+            
+            signAllTransactions: wallet.signAllTransactions,
+        }
+
+
+        const provider = new AnchorProvider(connection, anchorWallet, AnchorProvider.defaultOptions())
+
+        const legacyCtx = WhirlpoolContext.withProvider(provider, ORCA_LEGACY_PID)
+
+        const legacyClient = buildWhirlpoolClient(legacyCtx)
+
+        const decimalsA = tokenAMint.toBase58() === mintAddress ? 9 : tokenAMint.toBase58() === "So11111111111111111111111111111111111111112" ? 9 : 6
+
+        const decimalsB = tokenBMint.toBase58() === mintAddress ? 9 : tokenBMint.toBase58() === "So11111111111111111111111111111111111111112" ? 9 : 6
+
+        const initialPrice = new Decimal("1.0")
+
+        const initialTickIndex = PriceMath.priceToTickIndex(initialPrice, decimalsA, decimalsB)
+
+        const { poolKey, tx: createPoolTx } = await legacyClient.createPool(
+
+            whirlpoolConfig,
+
+            tokenAMint,
+
+            tokenBMint,
+
+            tickSpacing,
+
+            initialTickIndex,
+
+            wallet.publicKey
+        )
+
+        createPoolTx.feePayer = wallet.publicKey
+
+        createPoolTx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash
+
+        try {
+
+            await wallet.sendTransaction(createPoolTx, connection)
+
+
+        } catch(err) {
+
+            alert(err)
+
+            return
+        }
+
+        await setWhirlpoolsConfig("solanaDevnet")
+
+        const whirlpoolAddress = poolKey
+
+        const slippageBps = 100
+
+        const tokenAUnits = 1n * 10n ** BigInt(decimalsA);
+
+        const {
+            
+            quote,
+            
+            initializationCost,
+            
+            positionMint,
+            
+            callback: sendTx,
+        
+        } = await openFullRangePosition(
+            
+            connection,
+            
+            whirlpoolAddress,
+            
+            { tokenA: tokenAUnits },
+            
+            slippageBps,
+            
+            provider.wallet
+        )
+
+        try {
+            
+            const lpSig = await sendTx()
+
+        } catch(err) {
+
+            alert(err)
+
+            return
+        }
+
+
+        setPoolPKey(poolKey.toBase58())
+
+
+        setLpCreated(true)
+
+    }
+
+
+    function nextFunc() {
+
+        setNextClicked(true)
+    }
+
+    return (
+
+        <div>
+
+            {mintAddress === "" && <div>
+
+                <h1>Token Launchpad</h1>
+
+                <input style = {{width: 300}} type="text" placeholder="Your token name: " onChange={(e) => setName(e.target.value)}></input>
+
+                <br></br>
+
+                <input style={{width: 300}} type="text" placeholder="Your token symbol:" onChange={(e) => setSymbol(e.target.value)}></input>
+
+                <br></br>
+
+                <input style={{width: 300}} type="text" placeholder="Your token image url:" onChange={(e) => setUrl(e.target.value)}></input>
+
+                <br></br>
+
+                <button onClick={createToken} disabled={!wallet.connected || name === "" || symbol === "" || url === ""} title="Connect your wallet and enter token details">Create your token!</button>
+
+                </div>
+            }
+
+            {mintAddress !== "" && !isMinted && <div>
+
+                <div>Your token has been minted at address: {mintAddress}</div>
+
+                <div>Your Pinata metadata uri is: {uri}</div>
+
+                <button onClick={mintTokens}>Mint your tokens!</button>
+                
+            </div>}
+
+
+            {isMinted && !lpCreated && <div>
+
+                <div>Tokens have been minted to your wallet address! Please check.</div>
+
+                <label>Select a token to pair with:</label>
+
+                <select value={selectedToken} onChange={(e) => setSelectedToken(e.target.value)}>
+
+                    {tokens.map((token, index) => (
+
+                        <option key={index} value={token.mint}>{token.name}</option>
+                    ))}
+
+                </select>
+
+                <button onClick={createPool}>Create the Liquidity pool on ORCA</button>   
+                
+            </div>}
+
+            {lpCreated && !nextClicked && <div>
+
+                <div>Liquidity pool has been created on ORCA between {name} and {selectedToken.name} at {poolPKey}!</div>
+
+                <label>Select a token to pair with:</label>
+
+                <select value={selectedToken} onChange={(e) => setSelectedToken(e.target.value)}>
+
+                    {tokens.map((token, index) => (
+
+                        <option key={index} value={token.mint}>{token.name}</option>
+                    ))}
+
+                </select>
+                
+                <button onClick={createPool}>Create the liquidity pool!</button>
+
+                <button onClick={nextFunc}>Next</button>
+
+            </div>}
+
+            {nextClicked && <div>
+                
+                <button onClick={takeBack}>Create more tokens!</button> 
+
+            </div>}
+
+        </div>
+    )
+}
