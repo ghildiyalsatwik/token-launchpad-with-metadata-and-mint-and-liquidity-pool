@@ -1,16 +1,11 @@
 import { useConnection, useWallet } from "@solana/wallet-adapter-react"
 import { useState } from 'react'
 import { Keypair, Transaction, SystemProgram, PublicKey } from "@solana/web3.js"
-import { getMintLen, ExtensionType, LENGTH_SIZE, TYPE_SIZE, TOKEN_2022_PROGRAM_ID, createInitializeMetadataPointerInstruction, createInitializeMintInstruction, getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction, createMintToInstruction } from "@solana/spl-token"
+import { TOKEN_PROGRAM_ID, getMintLen, ExtensionType, LENGTH_SIZE, TYPE_SIZE, TOKEN_2022_PROGRAM_ID, createInitializeMetadataPointerInstruction, createInitializeMintInstruction, getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction, createMintToInstruction, NATIVE_MINT } from "@solana/spl-token"
 import { createInitializeInstruction, pack } from "@solana/spl-token-metadata"
 import axios from "axios"
-import { PDAUtil, ORCA_WHIRLPOOL_PROGRAM_ID as ORCA_LEGACY_PID, WhirlpoolContext, PriceMath, buildWhirlpoolClient } from "@orca-so/whirlpools-sdk"
-import { AnchorProvider } from "@coral-xyz/anchor"
-import Decimal from "decimal.js"
-import {
-    openFullRangePosition,
-    setWhirlpoolsConfig,
-  } from "@orca-so/whirlpools";
+import BN from "bn.js"
+import { InstructionType, makeCreateCpmmPoolInInstruction, Owner, TxBuilder, Raydium, DEVNET_PROGRAM_ID, getCpmmPdaAmmConfigId, getCreatePoolKeys, getATAAddress, TxVersion } from "@raydium-io/raydium-sdk-v2"
 
 export default function TokenLaunchpad({mintAddress, setMintAddress, isMinted, setIsMinted, lpCreated, setLpCreated, nextClicked, setNextClicked}) {
 
@@ -26,9 +21,11 @@ export default function TokenLaunchpad({mintAddress, setMintAddress, isMinted, s
 
     const [mintKP, setMintKP] = useState(null)
 
-    const [tokens, setTokens] = useState([{name: "WSOL", mint: "So11111111111111111111111111111111111111112", decimals: 9},
+    const [tokens, setTokens] = useState([{name: "SOL", mint: "So11111111111111111111111111111111111111111", decimals: 9},
         
-    {name: "USDC", mint: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU", decimals: 6}])
+    {name: "USDC", mint: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU", decimals: 6},
+
+    {name:"DONKE", mint: "5739VA6z6U2MHFV9pWy2burqTbez4EdexNuJ4RFi6qNg", decimals: 9}])
 
     const [selectedToken, setSelectedToken] = useState(tokens[0].mint)
 
@@ -188,141 +185,260 @@ export default function TokenLaunchpad({mintAddress, setMintAddress, isMinted, s
 
     async function createPool() {
 
-        const mintA = new PublicKey(mintAddress)
+        const payer = wallet.publicKey
 
-        const mintB = new PublicKey(selectedToken)
+        let mintTokenFunc = mintAddress
 
-        const [tokenAMint, tokenBMint] = mintA.toBuffer().compare(mintB.toBuffer()) < 0 ? [mintA, mintB] : [mintB, mintA]
+        let tokenFunc = selectedToken
 
-        const whirlpoolConfig = new PublicKey("2LecshUwdy9xi7meFgHtFJQNSKk4KdTrcpvaB56dP2NQ")
+        let useSOLBalance = false
 
-        const tickSpacing = 128
+        if(mintTokenFunc === "So11111111111111111111111111111111111111111") {
 
-        const whirlpoolPDA = PDAUtil.getWhirlpool(
+            mintTokenFunc = "So11111111111111111111111111111111111111112"
 
-            ORCA_LEGACY_PID,
-            
-            whirlpoolConfig,
+            useSOLBalance = true
 
-            tokenAMint,
-
-            tokenBMint,
-
-            tickSpacing
-        )
-
-        const whirlpoolPDAPublicKey = whirlpoolPDA.publicKey
-
-        const info = await connection.getAccountInfo(whirlpoolPDAPublicKey)
-
-        if(!!info) {
-
-            alert("This pool already exists, please try to create a different one.")
-
-            return
         }
 
-        const anchorWallet = {
-            
-            publicKey: wallet.publicKey,
-            
-            signTransaction: wallet.signTransaction,
-            
-            signAllTransactions: wallet.signAllTransactions,
+        if(tokenFunc === "So11111111111111111111111111111111111111111") {
+
+            tokenFunc = "So11111111111111111111111111111111111111112"
+
+            useSOLBalance = true
+
         }
 
 
-        const provider = new AnchorProvider(connection, anchorWallet, AnchorProvider.defaultOptions())
-
-        const legacyCtx = WhirlpoolContext.withProvider(provider, ORCA_LEGACY_PID)
-
-        const legacyClient = buildWhirlpoolClient(legacyCtx)
-
-        const decimalsA = tokenAMint.toBase58() === mintAddress ? 9 : tokenAMint.toBase58() === "So11111111111111111111111111111111111111112" ? 9 : 6
-
-        const decimalsB = tokenBMint.toBase58() === mintAddress ? 9 : tokenBMint.toBase58() === "So11111111111111111111111111111111111111112" ? 9 : 6
-
-        const initialPrice = new Decimal("1.0")
-
-        const initialTickIndex = PriceMath.priceToTickIndex(initialPrice, decimalsA, decimalsB)
-
-        const { poolKey, tx: createPoolTx } = await legacyClient.createPool(
-
-            whirlpoolConfig,
-
-            tokenAMint,
-
-            tokenBMint,
-
-            tickSpacing,
-
-            initialTickIndex,
-
-            wallet.publicKey
-        )
-
-        createPoolTx.feePayer = wallet.publicKey
-
-        createPoolTx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash
-
-        try {
-
-            await wallet.sendTransaction(createPoolTx, connection)
+        const isFront = new BN(new PublicKey(mintTokenFunc).toBuffer()).lte(new BN(new PublicKey(tokenFunc).toBuffer()))
 
 
-        } catch(err) {
+        let [mintA, mintB] = isFront ? [mintTokenFunc, tokenFunc] : [tokenFunc, mintTokenFunc]
 
-            alert(err)
 
-            return
-        }
+        const mintTokenAmount = new BN(1_000_000_000)
 
-        await setWhirlpoolsConfig("solanaDevnet")
+        const tokenAmount = new BN(1_000_000_000)
 
-        const whirlpoolAddress = poolKey
+        const [mintAAmount, mintBAmount] = isFront ? [mintTokenAmount, tokenAmount] : [tokenAmount, mintTokenAmount]
 
-        const slippageBps = 100
+        const mintAUseSolBalance = useSOLBalance && mintA === NATIVE_MINT.toBase58()
 
-        const tokenAUnits = 1n * 10n ** BigInt(decimalsA);
+        const mintBUseSolBalance = useSOLBalance && mintB === NATIVE_MINT.toBase58()
 
-        const {
+        const [mintAPubkey, mintBPubkey] = [new PublicKey(mintA), new PublicKey(mintB)]
+
+        const owner = new Owner(wallet.publicKey)
+
+        const txBuilder = new TxBuilder({connection,
             
-            quote,
+            feePayer: wallet.publicKey,
             
-            initializationCost,
+            owner,
             
-            positionMint,
-            
-            callback: sendTx,
-        
-        } = await openFullRangePosition(
-            
+            cluster: 'devnet'
+        })
+
+
+        const raydium = await Raydium.load({
+
             connection,
             
-            whirlpoolAddress,
-            
-            { tokenA: tokenAUnits },
-            
-            slippageBps,
-            
-            provider.wallet
-        )
+            owner: wallet.publicKey,
 
-        try {
-            
-            const lpSig = await sendTx()
+            cluster: 'devent'
 
-        } catch(err) {
+        })
 
-            alert(err)
+
+        const { account: userVaultA, instructionParams: userVaultAInstruction } = await raydium.account.getOrCreateTokenAccount({
+
+            mint: mintAPubkey,
+
+            tokenProgram: mintA === "So11111111111111111111111111111111111111112" || mintA === "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU" ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID,
+
+            owner: raydium.ownerPubKey,
+
+            createInfo: mintAUseSolBalance ? {payer: payer, amount: mintAAmount} : undefined,
+
+            notUseTokenAccount: mintAUseSolBalance,
+
+            skipCloseAccount: !mintAUseSolBalance,
+
+            associatedOnly: mintAUseSolBalance ? false : true,
+
+            checkCreateATAOwner: true
+
+        })
+
+
+        txBuilder.addInstruction(userVaultAInstruction || {})
+
+
+        const { account: userVaultB, instructionParams: userVaultBInstruction } = await raydium.account.getOrCreateTokenAccount({
+
+            mint: mintBPubkey,
+
+            tokenProgram: mintB === "So11111111111111111111111111111111111111112" || mintB === "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU" ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID,
+
+            owner: raydium.ownerPubKey,
+
+            createInfo: mintBUseSolBalance ? {payer: payer, amount: mintBAmount} : undefined,
+
+            notUseTokenAccount: mintBUseSolBalance,
+
+            skipCloseAccount: !mintBUseSolBalance,
+
+            associatedOnly: mintBUseSolBalance ? false : true,
+
+            checkCreateATAOwner: true
+        })
+
+
+        txBuilder.addInstruction(userVaultBInstruction || {})
+
+
+        if(userVaultA === undefined || userVaultB === undefined) {
+
+            alert("You don't have some token account")
 
             return
         }
 
 
-        setPoolPKey(poolKey.toBase58())
+        const feeConfigs = await raydium.api.getCpmmConfigs()
+
+        feeConfigs.forEach((config) => {
+
+            config.id = getCpmmPdaAmmConfigId(DEVNET_PROGRAM_ID.CREATE_CPMM_POOL_PROGRAM, config.index).publicKey.toBase58()
+        
+        })
 
 
+        const poolKeys = getCreatePoolKeys({
+
+            programId: DEVNET_PROGRAM_ID.CREATE_CPMM_POOL_PROGRAM,
+
+            configId: new PublicKey(feeConfigs[0].id),
+
+            mintA: mintAPubkey,
+
+            mintB: mintBPubkey
+        
+        })
+
+        const poolId = poolKeys.poolId
+
+        const info = await connection.getAccountInfo(poolId)
+
+        if(info) {
+
+            alert("This pool already exists!")
+
+            return
+        }
+
+        const startTime = new BN(0)
+
+
+        txBuilder.addInstruction({
+
+            instructions: [
+
+                makeCreateCpmmPoolInInstruction(
+
+                    DEVNET_PROGRAM_ID.CREATE_CPMM_POOL_PROGRAM,
+
+                    raydium.ownerPubKey,
+
+                    new PublicKey(feeConfigs[0].id),
+
+                    poolKeys.authority,
+
+                    poolKeys.poolId,
+
+                    mintAPubkey,
+
+                    mintBPubkey,
+
+                    poolKeys.lpMint,
+
+                    userVaultA,
+
+                    userVaultB,
+
+                    getATAAddress(raydium.ownerPubKey, poolKeys.lpMint).publicKey,
+
+                    poolKeys.vaultA,
+
+                    poolKeys.vaultB,
+
+                    DEVNET_PROGRAM_ID.CREATE_CPMM_POOL_FEE_ACC,
+
+                    new PublicKey(mintA === "So11111111111111111111111111111111111111112" || mintA === "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU" ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID),
+
+                    new PublicKey(mintB === "So11111111111111111111111111111111111111112" || mintB === "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU" ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID),
+
+                    poolKeys.observationId,
+
+                    mintAAmount,
+
+                    mintBAmount,
+
+                    startTime
+
+                )
+            ],
+
+            instructionTypes: [InstructionType.CpmmCreatePool]
+        })
+
+
+        const tx = await txBuilder.versionBuild({
+
+            txVersion: TxVersion.V0,
+
+            extInfo: {
+
+                address: {
+
+                     ...poolKeys, 
+                    
+                    mintA, 
+                        
+                    mintB, 
+                        
+                    programId: DEVNET_PROGRAM_ID.CREATE_CPMM_POOL_PROGRAM, 
+                        
+                    poolFeeAccount: DEVNET_PROGRAM_ID.CREATE_CPMM_POOL_FEE_ACC, feeConfig: feeConfigs[0]
+                }
+            }
+
+        })
+
+        const { transaction } = tx
+
+        transaction.feePayer = wallet.publicKey
+
+        const latestBlockhash = await connection.getLatestBlockhash()
+
+        transaction.recentBlockhash = latestBlockhash.blockhash
+
+
+        try {
+
+            await wallet.sendTransaction(transaction, connection)
+
+
+        } catch(err) {
+
+            console.error(err)
+
+            return
+        }
+
+        setPoolPKey(poolKeys.poolId.toBase58())
+    
         setLpCreated(true)
 
     }
@@ -384,13 +500,19 @@ export default function TokenLaunchpad({mintAddress, setMintAddress, isMinted, s
 
                 </select>
 
-                <button onClick={createPool}>Create the Liquidity pool on ORCA</button>   
+                <br></br>
+
+                <button onClick={createPool}>Create the Liquidity pool on Raydium</button>   
                 
             </div>}
 
             {lpCreated && !nextClicked && <div>
 
-                <div>Liquidity pool has been created on ORCA between {name} and {selectedToken.name} at {poolPKey}!</div>
+                <div>Liquidity pool has been created on Raydium between {name} and {selectedToken.name} at {poolPKey}!</div>
+
+                <div>Create another pool!</div>
+
+                <br></br>
 
                 <label>Select a token to pair with:</label>
 
@@ -402,8 +524,12 @@ export default function TokenLaunchpad({mintAddress, setMintAddress, isMinted, s
                     ))}
 
                 </select>
+
+                <br></br>
                 
                 <button onClick={createPool}>Create the liquidity pool!</button>
+
+                <br></br>
 
                 <button onClick={nextFunc}>Next</button>
 
